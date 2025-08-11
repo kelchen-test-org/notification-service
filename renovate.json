@@ -5,6 +5,8 @@
   "platformAutomerge": true,
   "ignoreTests": true,
 
+  "postUpdateOptions": ["gomodTidy"],
+
   "packageRules": [
     {
       "description": "Auto-merge patch updates for Konflux components",
