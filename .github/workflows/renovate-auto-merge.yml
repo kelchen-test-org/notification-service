@@ -1,0 +1,183 @@
+name: Renovate Auto-Merge
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    if: github.actor == 'red-hat-konflux[bot]'
+    
+    steps:
+      - name: Check if PR is ready for auto-merge
+        id: check-pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            
+            // Check if it's a dependency update from Renovate/Mintmaker
+            const title = pr.title.toLowerCase();
+            const body = pr.body ? pr.body.toLowerCase() : '';
+            
+            // Look for Renovate/dependency update patterns
+            const isRenovateUpdate = title.includes('chore(deps)') || 
+              title.includes('update dependency') || 
+              title.includes('bump') ||
+              body.includes('renovate') ||
+              body.includes('this pr contains the following updates');
+            
+            // Check if it's a safe update (patch/minor, not major)
+            const isSafeUpdate = !title.includes('major') && 
+              (title.includes('patch') || title.includes('minor') || 
+               title.match(/\d+\.\d+\.\d+/) && !title.includes('breaking'));
+            
+            // Check for specific safe patterns from your renovate config
+            const isKonfluxComponent = title.includes('quay.io/konflux-ci/');
+            const isTektonBundle = title.includes('tekton-catalog');
+            const isContainerImage = title.includes('registry.access.redhat.com') || 
+              title.includes('registry.fedoraproject.org');
+            const isGoToolchain = title.includes('go to v') && title.includes('patch');
+            
+            const shouldAutoMerge = isRenovateUpdate && 
+              (isSafeUpdate || isKonfluxComponent || isTektonBundle || isContainerImage || isGoToolchain);
+            
+            console.log(`PR title: ${pr.title}`);
+            console.log(`PR author: ${pr.user.login}`);
+            console.log(`Is Renovate update: ${isRenovateUpdate}`);
+            console.log(`Is safe update: ${isSafeUpdate}`);
+            console.log(`Should auto-merge: ${shouldAutoMerge}`);
+            
+            core.setOutput('should-auto-merge', shouldAutoMerge);
+
+      - name: Wait for CI checks
+        if: steps.check-pr.outputs.should-auto-merge == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const maxWaitTime = 15 * 60 * 1000; // 15 minutes
+            const checkInterval = 30 * 1000; // 30 seconds
+            const startTime = Date.now();
+            
+            while (Date.now() - startTime < maxWaitTime) {
+              const { data: checks } = await github.rest.checks.listForRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: context.payload.pull_request.head.sha,
+              });
+              
+              // Also check for status checks (some CI systems use status API)
+              const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: context.payload.pull_request.head.sha,
+              });
+              
+              const allChecks = [
+                ...checks.check_runs.map(check => ({
+                  name: check.name,
+                  conclusion: check.conclusion,
+                  status: check.status
+                })),
+                ...statuses.map(status => ({
+                  name: status.context,
+                  conclusion: status.state === 'success' ? 'success' : status.state === 'failure' ? 'failure' : null,
+                  status: status.state === 'pending' ? 'in_progress' : 'completed'
+                }))
+              ];
+              
+              const requiredChecks = allChecks.filter(check => 
+                check.name.includes('build') || 
+                check.name.includes('test') || 
+                check.name.includes('lint') ||
+                check.name.includes('ci') ||
+                check.name === 'build'
+              );
+              
+              if (requiredChecks.length === 0) {
+                console.log('No required checks found, waiting...');
+                await new Promise(resolve => setTimeout(resolve, checkInterval));
+                continue;
+              }
+              
+              const completedChecks = requiredChecks.filter(check => 
+                check.status === 'completed' || check.conclusion !== null
+              );
+              
+              if (completedChecks.length < requiredChecks.length) {
+                console.log(`Waiting for checks: ${completedChecks.length}/${requiredChecks.length} completed`);
+                await new Promise(resolve => setTimeout(resolve, checkInterval));
+                continue;
+              }
+              
+              const allPassed = completedChecks.every(check => check.conclusion === 'success');
+              const anyFailed = completedChecks.some(check => 
+                check.conclusion === 'failure' || check.conclusion === 'cancelled'
+              );
+              
+              if (anyFailed) {
+                console.log('Some CI checks failed, not auto-merging');
+                core.setFailed('Some CI checks failed');
+                return;
+              }
+              
+              if (allPassed) {
+                console.log('All CI checks passed!');
+                return;
+              }
+              
+              console.log('Waiting for CI checks to complete...');
+              await new Promise(resolve => setTimeout(resolve, checkInterval));
+            }
+            
+            console.log('Timeout waiting for CI checks');
+            core.setFailed('Timeout waiting for CI checks');
+
+      - name: Auto-approve PR
+        if: steps.check-pr.outputs.should-auto-merge == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                event: 'APPROVE',
+                body: '🤖 Auto-approved Renovate dependency update after CI passed'
+              });
+              console.log('PR approved successfully');
+            } catch (error) {
+              console.log('Error approving PR:', error.message);
+              // Continue anyway, approval might not be required
+            }
+
+      - name: Auto-merge PR
+        if: steps.check-pr.outputs.should-auto-merge == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              const result = await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                merge_method: 'squash',
+                commit_title: `${context.payload.pull_request.title} (#${context.issue.number})`,
+                commit_message: 'Auto-merged by Renovate workflow after CI passed'
+              });
+              console.log('PR merged successfully:', result.data.message);
+            } catch (error) {
+              console.log('Error merging PR:', error.message);
+              core.setFailed(`Failed to merge PR: ${error.message}`);
+            } 
