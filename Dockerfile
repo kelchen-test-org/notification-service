@@ -24,7 +24,7 @@ COPY pkg/notifier/ pkg/notifier/
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
 
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8-1790074235
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8-1790754119
 
 
 COPY LICENSE /licenses
